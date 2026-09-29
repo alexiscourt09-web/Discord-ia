@@ -23,7 +23,7 @@ PERSONAS = [
     {
         "name": "Gemi",
         "provider": "gemini",
-        "model": "gemini-2.5-flash",
+        "models": ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview"],
         "instructions": "Tu es Gemi, curieux, enthousiaste et un peu blagueur. "
         "Tu réponds en 1 à 4 phrases max, en français.",
     },
@@ -54,23 +54,34 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 session: aiohttp.ClientSession | None = None
-webhook: discord.Webhook | None = None
+webhook = None
 current_task: asyncio.Task | None = None
 max_turns = MAX_TURNS
 
 
 async def ask_gemini(p, system, prompt):
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{p['model']}:generateContent?key={GEMINI_KEY}"
-    )
-    body = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-    }
-    async with session.post(url, json=body) as r:
-        data = await r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    last_error = None
+    for model in p["models"]:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={GEMINI_KEY}"
+        )
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        }
+        try:
+            async with session.post(url, json=body) as r:
+                data = await r.json()
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(x.get("text", "") for x in parts if not x.get("thought")).strip()
+            if text:
+                return text
+            last_error = f"{model}: réponse vide {data}"
+        except Exception as e:
+            last_error = f"{model}: {e!r} | {str(data)[:400] if 'data' in locals() else ''}"
+        print(f"[{p['name']}] fallback -> {last_error}")
+    raise RuntimeError(f"Tous les modèles Gemini ont échoué ({last_error})")
 
 
 async def ask_openrouter(p, system, prompt):
@@ -125,6 +136,15 @@ async def generate(p, channel):
     return text.strip()[:1900]
 
 
+async def get_webhook(channel):
+    global webhook
+    if webhook is None:
+        hooks = await channel.webhooks()
+        webhook = next((h for h in hooks if h.name == "ai-chat"), None) or \
+            await channel.create_webhook(name="ai-chat")
+    return webhook
+
+
 async def conversation(channel, last_speaker=None):
     idx = 0
     for _ in range(max_turns):
@@ -137,21 +157,22 @@ async def conversation(channel, last_speaker=None):
         except Exception as e:
             print(f"[{p['name']}] erreur: {e}")
             return
-        await webhook.send(text, username=p["name"])
+        try:
+            hook = await get_webhook(channel)
+            await hook.send(text, username=p["name"])
+        except Exception as e:
+            print(f"Erreur webhook (permission 'Gérer les webhooks' ?): {e!r}")
+            return
         last_speaker = p["name"]
         await asyncio.sleep(DELAY)
 
 
 @bot.event
 async def on_ready():
-    global session, webhook
+    global session
     if session is None:
         session = aiohttp.ClientSession()
-    channel = bot.get_channel(CHANNEL_ID)
-    hooks = await channel.webhooks()
-    webhook = next((h for h in hooks if h.name == "ai-chat"), None) or \
-        await channel.create_webhook(name="ai-chat")
-    print(f"Connecté : {bot.user} | salon : #{channel.name}")
+    print(f"Connecté : {bot.user}")
 
 
 @bot.event
