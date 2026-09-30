@@ -24,8 +24,8 @@ PERSONAS = [
         "name": "Gemi",
         "provider": "gemini",
         "models": ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview"],
-        "instructions": "Tu es Gemi, curieux, enthousiaste et un peu blagueur. "
-        "Tu réponds en 1 à 4 phrases max, en français.",
+        "instructions": "Tu es Gemi, tu réfléchis beaucoup à chaque théorie pour trouver tous les points faibles et tu essayes de les corriger sans tien casser d’autre."
+        "Tu réponds en français.",
     },
     {
         "name": "Nemo",
@@ -38,15 +38,15 @@ PERSONAS = [
             "openrouter/free",
         ],
         "reasoning": True,
-        "instructions": "Tu es Nemo, analytique et rigoureux. Tu creuses les "
+        "instructions": "Tu es Nemo, rigoureux. Tu creuses les "
         "problèmes complexes et tu n'hésites pas à contredire les autres si "
-        "leur raisonnement est faux. 1 à 4 phrases max, en français.",
+        "leur raisonnement est faux. Tu dois trouver des nouvelles théories et creuser dans tes connaissances pour trouver de bonnes théories crédibles et exactes. Tu réponds en français.",
     },
 ]
 
 MAX_TURNS = 6        # nb de réponses IA après chaque message humain
-HISTORY_SIZE = 25    # nb de messages lus pour le contexte
-DELAY = 2            # secondes entre deux réponses
+HISTORY_SIZE = 10000   # nb de messages lus pour le contexte
+DELAY = 2           # secondes entre deux réponses
 # ---------------------------------------------------------------
 
 intents = discord.Intents.default()
