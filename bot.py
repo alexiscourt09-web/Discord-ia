@@ -45,8 +45,8 @@ PERSONAS = [
 ]
 
 MAX_TURNS = 6        # nb de réponses IA après chaque message humain
-HISTORY_SIZE = 10000   # nb de messages lus pour le contexte
-DELAY = 2           # secondes entre deux réponses
+HISTORY_SIZE = 25    # nb de messages lus pour le contexte
+DELAY = 2            # secondes entre deux réponses
 # ---------------------------------------------------------------
 
 intents = discord.Intents.default()
@@ -133,7 +133,23 @@ async def generate(p, channel):
 
     fn = ask_gemini if p["provider"] == "gemini" else ask_openrouter
     text = await fn(p, system, prompt)
-    return text.strip()[:1900]
+    return text.strip()
+
+
+def split_message(text, limit=1900):
+    """Découpe un long texte en morceaux <= limit, en coupant sur les sauts de ligne/espaces."""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        chunks.append(text)
+    return chunks
 
 
 async def get_webhook(channel):
@@ -159,7 +175,9 @@ async def conversation(channel, last_speaker=None):
             return
         try:
             hook = await get_webhook(channel)
-            await hook.send(text, username=p["name"])
+            for chunk in split_message(text):
+                await hook.send(chunk, username=p["name"])
+                await asyncio.sleep(0.5)
         except Exception as e:
             print(f"Erreur webhook (permission 'Gérer les webhooks' ?): {e!r}")
             return
