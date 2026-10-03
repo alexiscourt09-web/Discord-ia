@@ -92,7 +92,7 @@ MAX_WORKSPACE_CHANNELS = 495 # on s'arrête avant la limite de 500 salons
 CLEAR_MAX_MESSAGES = 500   # nb max de messages lus après un /clear
 MAX_CONTEXT_CHARS = 200_000  # taille max du contexte envoyé aux IA
 REFLEXION_MIN_CHECKS = 2     # nb minimal de vérifications par IA avant d'accepter une réponse
-REFLEXION_MAX_TURNS = 14     # nb max de tours de réflexion (sécurité anti-boucle)
+REFLEXION_MAX_TURNS = 64     # nb max de tours de réflexion (sécurité anti-boucle)
 CACHE_TTL = 600        # secondes de cache de la liste des salons lisibles
 # ---------------------------------------------------------------
 
