@@ -59,7 +59,7 @@ PERSONAS = [
     {
         "name": "Gemi",
         "provider": "gemini",
-        "models": ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview"],
+        "models": ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3-flash-preview"],
         "instructions": "Tu es Gemi, tu réponds de façon sérieuse en vérifiant toutes les infos que tu donnes. quand on te donne une info, tu dois la vérifier sauf si elle vient d’un autre salon. "
         "Tu réponds en français.",
     },
@@ -92,7 +92,7 @@ MAX_WORKSPACE_CHANNELS = 495 # on s'arrête avant la limite de 500 salons
 CLEAR_MAX_MESSAGES = 500   # nb max de messages lus après un /clear
 MAX_CONTEXT_CHARS = 200_000  # taille max du contexte envoyé aux IA
 REFLEXION_MIN_CHECKS = 2     # nb minimal de vérifications par IA avant d'accepter une réponse
-REFLEXION_MAX_TURNS = 64     # nb max de tours de réflexion (sécurité anti-boucle)
+REFLEXION_MAX_TURNS = 14     # nb max de tours de réflexion (sécurité anti-boucle)
 CACHE_TTL = 600        # secondes de cache de la liste des salons lisibles
 # ---------------------------------------------------------------
 
@@ -109,6 +109,7 @@ YT_RE = re.compile(
 # Une ligne d'appel d'outil (tolère puces, numéros, gras, backticks autour)
 TOOL_LINE_RE = re.compile(
     r"^[\s>*\-•\d.)`]*(SEARCH|FETCH|CHANNELS|READ|WRITE|CREATE|RENAME)\*{0,2}\s*:\s*\*{0,2}\s*(.+?)[\s`*]*$", re.I)
+LEAK_RE = re.compile(r"^\s*(let'?s|we need|we should|now we|okay,|ok,|i need to|first,? we|the user)\b", re.I)
 MAX_CALLS_PER_ROUND = 5   # nb d'appels d'outils acceptés en une seule réponse
 
 
@@ -959,22 +960,51 @@ async def generate(p, channel, extra_system="", turn_prompt=None, after_id=None,
     gl = resource_guilds(channel.guild)
     total = sum(len(visible_channels(g, channel.id)) for g in gl)
     servers = f"{total} salons lisibles répartis au hasard sur {len(gl)} serveurs"
+    done_calls = set()      # appels de lecture déjà exécutés dans cette réponse
+    force_final = False     # True = plus d'outils (limite atteinte ou IA qui tourne en rond)
+    retried = False
     for rnd in range(MAX_TOOL_ROUNDS + 1):
-        allow = rnd < MAX_TOOL_ROUNDS
+        allow = rnd < MAX_TOOL_ROUNDS and not force_final
         system = build_system(p, others, allow, servers, extra_system, actions)
         prompt = (f"Historique de la discussion :\n{transcript}\n{tool_log}\n\n"
                   + (turn_prompt or f"À toi de parler, {p['name']}."))
+        if not allow and tool_log:
+            prompt += ("\n\n(Plus aucun outil disponible : réponds maintenant avec les informations "
+                       "déjà obtenues, sans écrire de ligne commençant par SEARCH:, FETCH:, CHANNELS: "
+                       "ou READ:.)")
         text = (await fn(p, system, prompt, images)).strip()
         if final_check and final_check(text):
             return text
         calls = parse_tool_calls(text) if allow else []
         if not calls:
-            return text if allow else strip_tool_lines(text)
+            if allow:
+                return strip_tool_lines(text)
+            # Dernier tour : on ne poste jamais de commandes d'outils ni de raisonnement interne
+            if (parse_tool_calls(text) or LEAK_RE.match(strip_tool_lines(text))) and not retried:
+                retried = True
+                text = (await fn(p, system, prompt + (
+                    "\n\n(Ta réponse précédente contenait des commandes d'outils ou du raisonnement "
+                    "interne. Réponds maintenant UNIQUEMENT avec le message final, au format demandé, "
+                    "sans commande ni réflexion.)"), images)).strip()
+                if final_check and final_check(text):
+                    return text
+            cleaned = strip_tool_lines(text)
+            if parse_tool_calls(text) or LEAK_RE.match(cleaned):
+                return "(Je n'ai pas réussi à terminer ma recherche : peux-tu reformuler ou réessayer ?)"
+            return cleaned
         guild = channel.guild
         cap = MAX_TOOL_CHARS // len(calls)
+        repeats = 0
         for kind, arg in calls:
             print(f"[{p['name']}] outil {kind}: {arg[:100]}")
-            if kind == "SEARCH":
+            is_repeat = kind in ("SEARCH", "FETCH", "CHANNELS", "READ") and (kind, arg) in done_calls
+            if kind in ("SEARCH", "FETCH", "CHANNELS", "READ"):
+                done_calls.add((kind, arg))
+            if is_repeat:
+                repeats += 1
+                result = ("[Déjà demandé plus haut : le résultat est dans l'historique. Ne le redemande "
+                          "pas : change de requête ou réponds.]")
+            elif kind == "SEARCH":
                 result = await web_search(arg)
             elif kind == "FETCH":
                 result = await read_url(arg, guild, channel.id)
@@ -989,8 +1019,9 @@ async def generate(p, channel, extra_system="", turn_prompt=None, after_id=None,
                 result, imgs = await read_channel(guild, arg, channel.id)
                 images = (images + imgs)[-MAX_IMAGES:]
             tool_log += f"\n\n--- Résultat de {kind} {arg[:80]} ---\n{result[:cap]}\n--- fin ---"
-    return text
-
+        if repeats == len(calls):      # que des répétitions : l'IA tourne en rond
+            force_final = True
+    return strip_tool_lines(text)
 
 # ============================ DISCORD ============================
 
