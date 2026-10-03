@@ -99,6 +99,8 @@ TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".css"
             ".cpp", ".cs", ".go", ".rs", ".sql", ".sh", ".tsv"}
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
               ".webp": "image/webp"}
+DISCORD_LINK_RE = re.compile(
+    r"https?://(?:\w+\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)(?:/(\d+))?", re.I)
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 YT_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?(?:[^\s]*&)?v=|shorts/|embed/|live/)|youtu\.be/)([\w-]{11})")
@@ -146,12 +148,13 @@ TOOLS_HELP = (
     "ou de lire un lien, ta réponse peut être UNIQUEMENT une ou plusieurs lignes d'appel "
     "(une par ligne, 5 maximum, aucun autre texte) :\n"
     "SEARCH: <requête>  -> recherche sur le web\n"
-    "FETCH: <url>  -> lit une page web, un PDF ou la transcription d'une vidéo YouTube\n"
+    "FETCH: <url>  -> lit une page web, un PDF, la transcription d'une vidéo YouTube, ou un lien "
+    "discord.com/channels/... (le bot lit alors le salon/message si c'est autorisé)\n"
     "CHANNELS: <mots-clés>  -> cherche parmi des milliers de salons de ressources, d'après "
     "leur NOM (et leur description). Les salons sont répartis au hasard sur plusieurs serveurs : "
     "ne raisonne jamais par serveur, cherche uniquement par mots-clés (CHANNELS: * = aperçu du "
     "vocabulaire des noms)\n"
-    "READ: <nom exact du salon>  -> lit les derniers messages et fichiers d'un salon "
+    "READ: <nom exact ou ID du salon>  -> lit les derniers messages et fichiers d'un salon "
     "(ajoute \" | 60\" pour lire 60 messages au lieu de 30 ; \"nom @ serveur\" seulement "
     "si deux salons portent le même nom)\n"
     "Ces salons contiennent des ressources (infos, cours, règles, documents...). "
@@ -264,7 +267,11 @@ async def youtube_text(url, vid):
     return f"[Vidéo YouTube {url}]\nTitre : {title}\nTranscription : {transcript}"
 
 
-async def read_url(url):
+async def read_url(url, current=None, exclude_id=None):
+    dm = DISCORD_LINK_RE.search(url)
+    if dm:   # lien vers un salon/message Discord : on lit le salon avec le bot
+        return await read_discord_link(current, int(dm.group(2)),
+                                       int(dm.group(3)) if dm.group(3) else None, exclude_id)
     m = YT_RE.search(url)
     if m:
         return await youtube_text(url, m.group(1))
@@ -339,7 +346,7 @@ async def ingest(message: discord.Message):
         if u not in urls:
             urls.append(u)
     for u in urls[:3]:
-        texts.append(await read_url(u))
+        texts.append(await read_url(u, message.guild, message.channel.id))
 
     if texts or images:
         extras[message.id] = {"text": "\n".join(texts), "images": images}
@@ -384,8 +391,17 @@ def visible_channels(guild, exclude_id=None):
     return [c for c in hit[1] if c.id != exclude_id]
 
 
+def channel_id_from(text):
+    """'1477360415276269599' ou '<#1477360415276269599>' -> int, sinon None."""
+    t = text.strip().strip("<>#").strip()
+    return int(t) if t.isdigit() and len(t) >= 15 else None
+
+
 def rank_channels(chans, query):
     """Classe les salons par pertinence (nom, sujet, catégorie, serveur). Rapide sur 20 000 salons."""
+    cid = channel_id_from(query)
+    if cid:                      # recherche directe par ID de salon
+        return [c for c in chans if c.id == cid]
     q = norm(query.strip().lstrip("#"))
     tokens = [t for t in q.split() if len(t) >= 3 and t not in STOPWORDS]
     ranked = []
@@ -420,7 +436,7 @@ def rank_channels(chans, query):
 
 
 def describe_channel(c):
-    d = f"#{c.name} ({c.guild.name})"
+    d = f"#{c.name} ({c.guild.name}, id {c.id})"
     if c.guild.id in WRITE_ONLY_GUILD_IDS:
         d += " ✍ (écriture seule : pas de lecture)"
     elif WORKSPACE_GUILD_ID and c.guild.id == WORKSPACE_GUILD_ID:
@@ -508,7 +524,51 @@ def list_channels(current, arg, exclude_id):
     return head + "\n" + "\n".join(describe_channel(c) for c in ranked[:25])
 
 
-async def read_channel(current, arg, exclude_id):
+def linked_channels_note(texts, readable_ids, self_id):
+    """Résout les liens Discord trouvés dans des messages (salon lisible ou non)."""
+    seen, lines = set(), []
+    for t in texts:
+        for m in DISCORD_LINK_RE.finditer(t):
+            cid = int(m.group(2))
+            if cid == self_id or cid in seen:
+                continue
+            seen.add(cid)
+            link, mid = m.group(0), m.group(3)
+            tgt = bot.get_channel(cid)
+            g = getattr(tgt, "guild", None)
+            if tgt is None:
+                lines.append(f"- {link} : salon inaccessible (le bot n'est pas sur ce serveur)")
+            elif cid in readable_ids:
+                how = f"READ: {cid}" + (f" ou FETCH: {link} (message lié)" if mid else "")
+                lines.append(f"- {link} -> #{tgt.name} ({g.name}) : LISIBLE, utilise {how}")
+            elif g and g.id in WRITE_ONLY_GUILD_IDS:
+                lines.append(f"- {link} -> #{tgt.name} ({g.name}) : serveur en écriture seule, lecture interdite")
+            else:
+                lines.append(f"- {link} -> #{tgt.name} ({getattr(g, 'name', '?')}) : non lisible "
+                             "(salon privé/bloqué, fil, forum ou serveur non autorisé)")
+            if len(lines) >= 8:
+                return lines
+    return lines
+
+
+async def read_discord_link(current, cid, mid=None, exclude_id=None):
+    """Lit le salon (ou le message) vers lequel pointe un lien discord.com/channels/..."""
+    readable = collect_channels(current, "", exclude_id) if current else []
+    if any(c.id == cid for c in readable):
+        out, _ = await read_channel(current, str(cid), exclude_id, around=mid)
+        return out
+    tgt = bot.get_channel(cid)
+    if tgt is None:
+        return "[Lien Discord : salon introuvable (le bot n'est pas sur ce serveur ou n'y a pas accès)]"
+    g = getattr(tgt, "guild", None)
+    if g and g.id in WRITE_ONLY_GUILD_IDS:
+        why = "serveur en écriture seule (lecture interdite)"
+    else:
+        why = "salon privé, bloqué, fil/forum, ou serveur non autorisé"
+    return f"[Lien Discord vers #{tgt.name} ({getattr(g, 'name', '?')}) : lecture impossible - {why}]"
+
+
+async def read_channel(current, arg, exclude_id, around=None):
     """Lit les derniers messages + fichiers d'un salon. Retourne (texte, images)."""
     name, server, limit = parse_target(arg)
     if server and not resource_guilds(current, server):
@@ -522,13 +582,20 @@ async def read_channel(current, arg, exclude_id):
                 f"pour chercher. Exemples de salons : {sample}]"), []
     ch = ranked[0]
     try:
-        msgs = [m async for m in ch.history(limit=limit)]
+        if around:   # lien vers un message précis : on lit autour de lui
+            msgs = [m async for m in ch.history(limit=min(limit, 25),
+                                                around=discord.Object(id=around))]
+            msgs.sort(key=lambda m: m.id)
+        else:
+            msgs = [m async for m in ch.history(limit=limit)]
+            msgs.reverse()
     except Exception as e:
         return f"[Lecture de #{ch.name} impossible : {e}]", []
-    msgs.reverse()
 
-    lines, atts = [], []
+    lines, atts, raw = [], [], []
     for m in msgs:
+        raw.append(m.content + " " + " ".join(
+            f"{e.title or ''} {e.description or ''}" for e in m.embeds[:2]))
         body = m.content
         for a in m.attachments:
             body += f" [Fichier : {a.filename}]"
@@ -538,7 +605,8 @@ async def read_channel(current, arg, exclude_id):
             if bits:
                 body += f" [Embed : {bits[:300]}]"
         if body.strip():
-            lines.append(f"[{m.created_at.strftime('%d/%m %H:%M')}] {m.author.display_name}: {body}")
+            mark = "👉 " if around and m.id == around else ""
+            lines.append(f"{mark}[{m.created_at.strftime('%d/%m %H:%M')}] {m.author.display_name}: {body}")
     block = "\n".join(lines)
     if len(block) > 7000:
         block = "(...début tronqué...)\n" + block[-7000:]
@@ -555,11 +623,16 @@ async def read_channel(current, arg, exclude_id):
         head += f" | catégorie : {ch.category.name}"
     if ch.topic:
         head += f" | description : {ch.topic}"
-    head += f" | {len(msgs)} derniers messages]"
+    head += (" | messages autour du message lié (👉)]" if around
+             else f" | {len(msgs)} derniers messages]")
     out = head + "\n" + (block or "(aucun message)")
     if file_texts:
         out += "\n\n[Contenu des fichiers récents]\n" + "\n".join(file_texts)
-    others = [f"#{c.name} ({c.guild.name})" for c in ranked[1:4]]
+    readable_ids = {c.id for c in collect_channels(current, "", exclude_id)}
+    links = linked_channels_note(raw, readable_ids, ch.id)
+    if links:
+        out += "\n\n[Liens vers d'autres salons trouvés dans ces messages]\n" + "\n".join(links)
+    others = [f"#{c.name} ({c.guild.name})" for c in ranked[1:4]] if not around else []
     if others:
         out += ("\n\n(Autres salons proches : " + ", ".join(others) +
                 ' - pour en lire un autre : READ: nom @ serveur)')
@@ -593,6 +666,13 @@ def usable_channels(ws, ai_channel_id, need):
 
 def resolve_strict(chans, name, exact_only=False):
     """Trouve UN salon sans ambiguïté, sinon retourne une erreur (jamais de devinette risquée)."""
+    cid = channel_id_from(name)
+    if cid:
+        found = [c for c in chans if c.id == cid]
+        if found:
+            return found[0], None
+        return None, (f"aucun salon accessible avec l'ID {cid} (serveur non autorisé, "
+                      "salon protégé, ou le bot n'a pas la permission d'y écrire)")
     q = norm(name.strip().lstrip("#"))
     if not q:
         return None, "nom de salon vide"
@@ -654,7 +734,10 @@ def write_targets(ai_channel_id):
     ws = workspace_guild()
     if ws:
         out += usable_channels(ws, ai_channel_id, "send_messages")
-    out += write_only_channels(ai_channel_id)
+    for gid in WRITE_ONLY_GUILD_IDS:
+        g = bot.get_guild(gid)
+        if g and g.id != WORKSPACE_GUILD_ID:
+            out += usable_channels(g, ai_channel_id, "send_messages")
     return out
 
 
@@ -740,7 +823,7 @@ def write_help():
     ws = workspace_guild()
     wos = [g.name for g in (bot.get_guild(i) for i in WRITE_ONLY_GUILD_IDS) if g]
     t = "\n\nACTIONS (tu choisis toi-même le salon ; ✍ dans CHANNELS = écriture possible) :\n"
-    t += ("WRITE: <salon> | <message>  -> poste un message dans ce salon (les lignes suivantes font "
+    t += ("WRITE: <salon : nom ou ID numérique> | <message>  -> poste un message dans ce salon (les lignes suivantes font "
           "partie du message, jusqu'à la prochaine commande ; si deux salons ont le même nom, "
           "écris « salon @ serveur »)\n")
     if ws:
@@ -885,7 +968,7 @@ async def generate(p, channel):
             if kind == "SEARCH":
                 result = await web_search(arg)
             elif kind == "FETCH":
-                result = await read_url(arg)
+                result = await read_url(arg, guild, channel.id)
             elif kind == "CHANNELS":
                 result = list_channels(guild, arg, channel.id)
             elif kind in ("WRITE", "CREATE", "RENAME"):
@@ -1003,6 +1086,15 @@ async def on_ready():
     if session is None:
         session = aiohttp.ClientSession()
     print(f"Connecté : {bot.user} | salons IA : {sorted(ai_channels)}")
+    # Diagnostic de la configuration d'écriture (visible dans les logs Railway)
+    if not (WORKSPACE_GUILD_ID or WRITE_ONLY_GUILD_IDS):
+        print("⚠️ Écriture dans d'autres salons DÉSACTIVÉE : définis WORKSPACE_GUILD_ID "
+              "et/ou WRITE_ONLY_GUILD_IDS dans les variables Railway.")
+    for label, ids in (("Serveur de travail", [WORKSPACE_GUILD_ID] if WORKSPACE_GUILD_ID else []),
+                       ("Écriture seule", sorted(WRITE_ONLY_GUILD_IDS))):
+        for gid in ids:
+            g = bot.get_guild(gid)
+            print(f"{label} {gid} : " + (f"OK ({g.name})" if g else "INTROUVABLE (bot non invité ?)"))
 
 
 @bot.event
