@@ -60,8 +60,8 @@ PERSONAS = [
         "name": "Gemi",
         "provider": "gemini",
         "models": ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview"],
-        "instructions": "Tu es Gemi, curieux, enthousiaste et un peu blagueur. "
-        "Tu réponds en 1 à 4 phrases max, en français.",
+        "instructions": "Tu es Gemi, tu réponds de façon sérieuse en vérifiant toutes les infos que tu donnes. quand on te donne une info, tu dois la vérifier sauf si elle vient d’un autre salon."
+        "Tu réponds en français.",
     },
     {
         "name": "Nemo",
@@ -76,19 +76,19 @@ PERSONAS = [
         "reasoning": True,
         "instructions": "Tu es Nemo, analytique et rigoureux. Tu creuses les "
         "problèmes complexes et tu n'hésites pas à contredire les autres si "
-        "leur raisonnement est faux. 1 à 4 phrases max, en français.",
+        "leur raisonnement est faux. Tu réponds en français.",
     },
 ]
 
 MAX_TURNS = 6          # nb de réponses IA après chaque message humain
-HISTORY_SIZE = 25      # nb de messages lus pour le contexte
+HISTORY_SIZE = 2500     # nb de messages lus pour le contexte
 DELAY = 2              # secondes entre deux réponses
 MAX_CHARS = 8000       # taille max du contenu d'une page / d'un fichier
-MAX_TOOL_ROUNDS = 3    # nb max de recherches/lectures par réponse d'une IA
+MAX_TOOL_ROUNDS = 10    # nb max de recherches/lectures par réponse d'une IA
 MAX_FILE_BYTES = 4_000_000
 MAX_IMAGES = 2         # images transmises à Gemini
-MAX_TOOL_CHARS = 15000 # taille max du résultat d'un outil
-MAX_WORKSPACE_CHANNELS = 480 # on s'arrête avant la limite de 500 salons
+MAX_TOOL_CHARS = 30000 # taille max du résultat d'un outil
+MAX_WORKSPACE_CHANNELS = 495 # on s'arrête avant la limite de 500 salons
 CLEAR_MAX_MESSAGES = 500   # nb max de messages lus après un /clear
 MAX_CONTEXT_CHARS = 200_000  # taille max du contexte envoyé aux IA
 CACHE_TTL = 600        # secondes de cache de la liste des salons lisibles
@@ -157,11 +157,10 @@ TOOLS_HELP = (
     "READ: <nom exact ou ID du salon>  -> lit les derniers messages et fichiers d'un salon "
     "(ajoute \" | 60\" pour lire 60 messages au lieu de 30 ; \"nom @ serveur\" seulement "
     "si deux salons portent le même nom)\n"
-    "Ces salons contiennent des ressources (infos, cours, règles, documents...). "
+    "Ces salons contiennent des ressources qui sont sûres et vérifiées. "
     "Si la question peut y trouver réponse, cherche avec CHANNELS (essaie plusieurs "
     "formulations/mots-clés si besoin) puis lis le salon le plus approprié avec READ.\n"
-    "Tu recevras le résultat puis tu pourras répondre. N'utilise un outil que si c'est "
-    "vraiment utile, sinon réponds directement."
+    "Tu recevras le résultat puis tu pourras répondre. "
 )
 
 intents = discord.Intents.default()
