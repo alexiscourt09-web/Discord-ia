@@ -156,7 +156,7 @@ MAX_WORKSPACE_CHANNELS = 495 # on s'arrête avant la limite de 500 salons
 CLEAR_MAX_MESSAGES = 500   # nb max de messages lus après un /clear
 MAX_CONTEXT_CHARS = 200_000  # taille max du contexte envoyé aux IA
 REFLEXION_MIN_CHECKS = 2     # nb minimal de vérifications par IA avant d'accepter une réponse
-REFLEXION_MAX_TURNS = 72     # nb max de tours de réflexion (sécurité anti-boucle)
+REFLEXION_MAX_TURNS = 48     # nb max de tours de réflexion (sécurité anti-boucle)
 REFLEXION_PARTICIPANTS = 4   # nb d'IA qui débattent ensemble (les suivantes sont des remplaçantes)
 CHAT_PARTICIPANTS = 2        # nb d'IA qui discutent en mode normal
 MAX_FAILOVERS = 12           # nb max de remplacements d'IA par réponse
@@ -223,7 +223,7 @@ TOOLS_HELP = (
     "CHANNELS: <mots-clés>  -> cherche parmi des milliers de salons de ressources, d'après "
     "leur NOM (et leur description). Les salons sont répartis au hasard sur plusieurs serveurs : "
     "ne raisonne jamais par serveur, cherche uniquement par mots-clés (CHANNELS: * = aperçu du "
-    "vocabulaire des noms). si vous cherchez des informations sur minecraft, nottament sur le wiki, elles sont dans ce salon, utilisez-le car le site du wiki n’est pas à jour. donc UTILISEZ ces salons et N’UTILISEZ PAS LE SITE DU WIKI\n"
+    "vocabulaire des noms). si vous cherchez des informations sur minecraft, nottament sur le wiki, elles sont dans ces salons, utilisez-les car le site du wiki n’est pas à jour. donc UTILISEZ ces salons et N’UTILISEZ PAS LE SITE DU WIKI\n"
     "READ: <nom exact ou ID du salon>  -> lit les derniers messages et fichiers d'un salon "
     "(ajoute \" | 60\" pour lire 60 messages au lieu de 30 ; \"nom @ serveur\" seulement "
     "si deux salons portent le même nom)\n"
