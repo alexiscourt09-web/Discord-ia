@@ -10,7 +10,7 @@ import socket
 import time
 import unicodedata
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -50,35 +50,99 @@ STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "ai_state.json")
 RESOURCE_GUILD_IDS = {int(x) for x in os.environ.get("RESOURCE_GUILD_IDS", "").replace(" ", "").split(",") if x}
 
 # ---------------------------------------------------------------
-# CONFIG : modifie / ajoute tes IA ici
-# provider = "gemini" ou "openrouter"
-# "models" = liste essayée dans l'ordre (fallback auto)
-# "reasoning": True active le mode réflexion (openrouter)
+# CATALOGUE DES IA
+# Chaque IA est activée seulement si sa clé est définie dans les variables Railway.
+# L'ordre compte : les premières IA disponibles sont les "titulaires", les suivantes
+# sont les remplaçantes quand un quota est dépassé.
+# Pour changer les modèles d'une IA sans toucher au code : variable <FOURNISSEUR>_MODELS
+# (liste séparée par des virgules, ex. GROQ_MODELS=openai/gpt-oss-120b,llama-3.3-70b-versatile).
+# DISABLED_PERSONAS = noms d'IA à ignorer (ex. Nemo,HuggingFace).
 # ---------------------------------------------------------------
-PERSONAS = [
+
+def _env_models(var, default):
+    return [m.strip() for m in os.environ.get(var, "").split(",") if m.strip()] or default
+
+
+def _generic_instructions(name):
+    return (f"Tu es {name}, analytique et rigoureux. Tu vérifies toutes les infos que tu donnes, "
+            "sauf si elles viennent d'un autre salon. Tu n'hésites pas à contredire les autres "
+            "IA si leur raisonnement est faux. Tu réponds en français.")
+
+
+ALL_PERSONAS = [
     {
         "name": "Gemi",
         "provider": "gemini",
-        "models": ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3-flash-preview"],
+        "key_env": "GEMINI_API_KEY",
+        "models": _env_models("GEMINI_MODELS",
+                              ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3-flash-preview"]),
         "instructions": "Tu es Gemi, tu réponds de façon sérieuse en vérifiant toutes les infos que tu donnes. quand on te donne une info, tu dois la vérifier sauf si elle vient d’un autre salon. "
         "Tu réponds en français.",
     },
     {
         "name": "Nemo",
-        "provider": "openrouter",
-        "models": [
+        "provider": "openai",
+        "key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": _env_models("OPENROUTER_MODELS", [
             "nvidia/nemotron-3-ultra-550b-a55b:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
-            "inclusionai/ling-2.6-1t:free",
-            "minimax/minimax-m2.5:free",
             "openrouter/free",
-        ],
-        "reasoning": True,
+        ]),
+        "extra_body": {"reasoning": {"enabled": True}},
         "instructions": "Tu es Nemo, analytique et rigoureux. Tu creuses les "
         "problèmes complexes et tu n'hésites pas à contredire les autres si "
         "leur raisonnement est faux. Tu réponds en français.",
     },
+    {
+        "name": "Groq", "provider": "openai", "key_env": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": _env_models("GROQ_MODELS", ["openai/gpt-oss-120b"]),
+        "max_prompt_chars": 22000, "max_tokens": 1800,    # limites de tokens/minute du palier gratuit
+        "instructions": _generic_instructions("Groq"),
+    },
+    {
+        "name": "Mistral", "provider": "openai", "key_env": "MISTRAL_API_KEY",
+        "base_url": "https://api.mistral.ai/v1",
+        "models": _env_models("MISTRAL_MODELS", ["mistral-large-latest", "mistral-small-latest",
+                                                 "open-mistral-nemo"]),
+        "max_prompt_chars": 120000, "max_tokens": 3000,
+        "instructions": _generic_instructions("Mistral"),
+    },
+    {
+        "name": "Cloudflare", "provider": "openai", "key_env": "CLOUDFLARE_API_TOKEN",
+        "base_url": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+        "models": _env_models("CLOUDFLARE_MODELS", ["@cf/openai/gpt-oss-120b",
+                                                    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                                                    "@cf/openai/gpt-oss-20b"]),
+        "max_prompt_chars": 30000, "max_tokens": 2000,
+        "instructions": _generic_instructions("Cloudflare"),
+    },
+    {
+        "name": "HuggingFace", "provider": "openai", "key_env": "HF_TOKEN",
+        "base_url": "https://router.huggingface.co/v1",
+        "models": _env_models("HF_MODELS", ["openai/gpt-oss-120b:fastest",
+                                            "meta-llama/Llama-3.3-70B-Instruct:fastest"]),
+        "max_prompt_chars": 30000, "max_tokens": 2000,
+        "instructions": _generic_instructions("HuggingFace"),
+    },
 ]
+
+DISABLED_PERSONAS = {n.strip().lower() for n in os.environ.get("DISABLED_PERSONAS", "").split(",") if n.strip()}
+
+
+def persona_configured(p):
+    """Clé présente (et, pour Cloudflare, identifiant de compte présent)."""
+    if not os.environ.get(p["key_env"]):
+        return False
+    for var in re.findall(r"\{(\w+)\}", p.get("base_url", "")):
+        if not os.environ.get(var):
+            return False
+    return True
+
+
+PERSONAS = [p for p in ALL_PERSONAS
+            if persona_configured(p) and p["name"].lower() not in DISABLED_PERSONAS]
 
 MAX_TURNS = 6          # nb de réponses IA après chaque message humain
 HISTORY_SIZE = 2500     # nb de messages lus pour le contexte
@@ -92,7 +156,10 @@ MAX_WORKSPACE_CHANNELS = 495 # on s'arrête avant la limite de 500 salons
 CLEAR_MAX_MESSAGES = 500   # nb max de messages lus après un /clear
 MAX_CONTEXT_CHARS = 200_000  # taille max du contexte envoyé aux IA
 REFLEXION_MIN_CHECKS = 2     # nb minimal de vérifications par IA avant d'accepter une réponse
-REFLEXION_MAX_TURNS = 320000     # nb max de tours de réflexion (sécurité anti-boucle)
+REFLEXION_MAX_TURNS = 24     # nb max de tours de réflexion (sécurité anti-boucle)
+REFLEXION_PARTICIPANTS = 4   # nb d'IA qui débattent ensemble (les suivantes sont des remplaçantes)
+CHAT_PARTICIPANTS = 2        # nb d'IA qui discutent en mode normal
+MAX_FAILOVERS = 12           # nb max de remplacements d'IA par réponse
 CACHE_TTL = 600        # secondes de cache de la liste des salons lisibles
 # ---------------------------------------------------------------
 
@@ -847,61 +914,228 @@ def write_help():
 
 # ============================ IA ============================
 
+# ===================== DISPONIBILITÉ DES IA (quotas) =====================
+# Quand une IA dépasse son quota (ou plante), elle est mise en pause automatiquement et
+# une autre prend sa place : plus de boucle d'échecs, plus de crash.
+
+class ProviderUnavailable(Exception):
+    def __init__(self, name, reason):
+        super().__init__(f"{name} indisponible : {reason}")
+        self.reason = reason
+
+
+_cooldown = {}           # (nom IA, modèle) -> (fin du blocage, raison)
+_persona_cooldown = {}   # nom IA -> (fin du blocage, raison)
+
+
+def _seconds_to_utc_midnight():
+    now = datetime.now(timezone.utc)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=30, microsecond=0)
+    return (nxt - now).total_seconds()
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def classify_failure(status, text, retry_after=None):
+    """-> (secondes de blocage, portée 'model' | 'persona', raison courte)."""
+    t = (text or "").lower()
+    compact = re.sub(r"[\s_-]+", "", t)
+    daily = (any(k in t for k in ("per day", "tokens per day", "daily", "(tpd)", "(rpd)"))
+             or "perday" in compact)
+    minute = "per minute" in t or "perminute" in compact or "(tpm)" in t or "(rpm)" in t
+    account_wide = "free-models-per-day" in t or "neurons" in t
+    try:
+        retry = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        retry = None
+    if status == 429:
+        if daily or account_wide:
+            return (_clamp(_seconds_to_utc_midnight(), 60, 86400),
+                    "persona" if account_wide else "model", "quota journalier atteint")
+        if minute:
+            return _clamp(retry or 60, 5, 900), "model", "limite par minute"
+        if "quota" in t or "insufficient" in t or "credit" in t:
+            return 1800, "model", "quota atteint"
+        return _clamp(retry or 60, 5, 900), "model", "trop de requêtes (429)"
+    if status in (401, 403):
+        return 6 * 3600, "persona", f"clé refusée ({status})"
+    if status == 402:
+        return 12 * 3600, "persona", "crédits épuisés (402)"
+    if status == 404:
+        return 24 * 3600, "model", "modèle introuvable (404)"
+    if status == 413:
+        return 300, "model", "requête trop grosse"
+    if status >= 500 or status == 408:
+        return 60, "model", f"service surchargé ({status})"
+    return 120, "model", f"erreur {status}"
+
+
+def mark_failure(p, model, status, text, retry_after=None):
+    secs, scope, reason = classify_failure(status, text, retry_after)
+    until = time.time() + secs
+    if scope == "persona":
+        _persona_cooldown[p["name"]] = (until, reason)
+    else:
+        _cooldown[(p["name"], model)] = (until, reason)
+    print(f"[{p['name']}] {model} en pause {int(secs)}s ({scope}) : {reason}")
+    return reason
+
+
+def mark_persona_down(p, secs, reason):
+    until = time.time() + secs
+    old = _persona_cooldown.get(p["name"])
+    if not old or old[0] < until:
+        _persona_cooldown[p["name"]] = (until, reason)
+
+
+def usable_models(p):
+    now = time.time()
+    pc = _persona_cooldown.get(p["name"])
+    if pc and pc[0] > now:
+        return []
+    return [m for m in p["models"] if _cooldown.get((p["name"], m), (0, ""))[0] <= now]
+
+
+def persona_available(p):
+    return bool(usable_models(p))
+
+
+def pick_active(n, avoid=()):
+    """Les n premières IA disponibles (dans l'ordre du catalogue), hors 'avoid'."""
+    return [p for p in PERSONAS if p["name"] not in avoid and persona_available(p)][:n]
+
+
+def fit_prompt(prompt, limit):
+    """Réduit un prompt trop long (palier gratuit à faible limite de tokens)."""
+    if len(prompt) <= limit:
+        return prompt
+    head = limit // 4
+    return (prompt[:head] + "\n(...contexte tronqué pour respecter la limite de ce service...)\n"
+            + prompt[-(limit - head):])
+
+
+def _fmt_duration(secs):
+    secs = int(secs)
+    if secs >= 3600:
+        return f"{secs // 3600} h {secs % 3600 // 60:02d} min"
+    return f"{max(secs // 60, 1)} min"
+
+
+def status_lines():
+    now = time.time()
+    lines = []
+    for p in ALL_PERSONAS:
+        n = p["name"]
+        if n.lower() in DISABLED_PERSONAS:
+            lines.append(f"⚪ {n} : désactivée (DISABLED_PERSONAS)")
+        elif not persona_configured(p):
+            lines.append(f"⚪ {n} : clé manquante ({p['key_env']})")
+        else:
+            pc = _persona_cooldown.get(n)
+            if pc and pc[0] > now:
+                lines.append(f"⏳ {n} : en pause {_fmt_duration(pc[0] - now)} ({pc[1]})")
+                continue
+            down = [(m, _cooldown[(n, m)]) for m in p["models"]
+                    if _cooldown.get((n, m), (0, ""))[0] > now]
+            if len(down) == len(p["models"]):
+                lines.append(f"⏳ {n} : tous les modèles en pause (ex. {down[0][1][1]})")
+            elif down:
+                d = ", ".join(f"{m} ({r[1]}, {_fmt_duration(r[0] - now)})" for m, r in down)
+                lines.append(f"🟡 {n} : prête, mais en pause : {d}")
+            else:
+                lines.append(f"✅ {n} : prête ({p['models'][0]})")
+    return lines
+
+
 async def ask_gemini(p, system, prompt, images=None):
-    last_error = None
+    last = "aucun modèle utilisable"
     parts = [{"inline_data": {"mime_type": mime, "data": base64.b64encode(d).decode()}}
              for mime, d in (images or [])]
     parts.append({"text": prompt})
-    for model in p["models"]:
+    for model in list(p["models"]):
+        if model not in usable_models(p):   # en pause (ou IA entière en pause)
+            continue
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                f"{model}:generateContent?key={GEMINI_KEY}")
-        body = {
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": parts}],
-        }
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": parts}]}
         try:
-            async with session.post(url, json=body) as r:
-                data = await r.json()
-            rparts = data["candidates"][0]["content"]["parts"]
-            text = "".join(x.get("text", "") for x in rparts if not x.get("thought")).strip()
-            if text:
-                return text
-            last_error = f"{model}: réponse vide {data}"
+            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                status, retry, raw = r.status, r.headers.get("Retry-After"), await r.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {}
+            if status == 200:
+                try:
+                    rparts = data["candidates"][0]["content"]["parts"]
+                    text = "".join(x.get("text", "") for x in rparts if not x.get("thought")).strip()
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    text = ""
+                if text:
+                    return text
+                _cooldown[(p["name"], model)] = (time.time() + 30, "réponse vide ou bloquée")
+                last = f"{model}: réponse vide"
+            else:
+                last = f"{model}: HTTP {status} - {mark_failure(p, model, status, raw, retry)}"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            last_error = f"{model}: {e!r} | {str(data)[:400] if 'data' in locals() else ''}"
-        print(f"[{p['name']}] fallback -> {last_error}")
-    raise RuntimeError(f"Tous les modèles Gemini ont échoué ({last_error})")
+            _cooldown[(p["name"], model)] = (time.time() + 60, "erreur réseau")
+            last = f"{model}: {e!r}"
+        print(f"[{p['name']}] fallback -> {last}")
+    raise ProviderUnavailable(p["name"], last)
 
 
-async def ask_openrouter(p, system, prompt, images=None):
-    headers = {"Authorization": f"Bearer {OPENROUTER_KEY}"}
-    last_error = None
-    for model in p["models"]:
-        body = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": 4000,
-        }
-        if p.get("reasoning"):
-            body["reasoning"] = {"enabled": True}
+async def ask_openai_compat(p, system, prompt, images=None):
+    """OpenRouter, Groq, Mistral, Cloudflare, Cerebras, SambaNova, Hugging Face (API compatible OpenAI)."""
+    key = os.environ.get(p["key_env"], "")
+    base = re.sub(r"\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), p["base_url"]).rstrip("/")
+    prompt = fit_prompt(prompt, p.get("max_prompt_chars", 120000))
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    last = "aucun modèle utilisable"
+    for model in list(p["models"]):
+        if model not in usable_models(p):   # en pause (ou IA entière en pause)
+            continue
+        body = {"model": model,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": prompt}],
+                "max_tokens": p.get("max_tokens", 4000)}
+        body.update(p.get("extra_body", {}))
         try:
-            async with session.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json=body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as r:
-                data = await r.json()
-            text = (data["choices"][0]["message"].get("content") or "").strip()
-            if text:
-                return text
-            last_error = f"{model}: réponse vide"
+            async with session.post(base + "/chat/completions", json=body, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=120)) as r:
+                status, retry, raw = r.status, r.headers.get("Retry-After"), await r.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {}
+            err = data.get("error") if isinstance(data, dict) else None
+            if status == 200 and not err:
+                try:
+                    text = (data["choices"][0]["message"].get("content") or "").strip()
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    text = ""
+                if text:
+                    return text
+                _cooldown[(p["name"], model)] = (time.time() + 30, "réponse vide")
+                last = f"{model}: réponse vide"
+            else:
+                code = status
+                if status == 200 and isinstance(err, dict) and str(err.get("code", "")).isdigit():
+                    code = int(err["code"])          # OpenRouter : erreur dans un HTTP 200
+                elif status == 200:
+                    code = 500
+                last = f"{model}: HTTP {code} - {mark_failure(p, model, code, raw, retry)}"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            last_error = f"{model}: {e} | {str(data)[:400] if 'data' in locals() else ''}"
-        print(f"[{p['name']}] fallback -> {last_error}")
-    raise RuntimeError(f"Tous les modèles ont échoué ({last_error})")
+            _cooldown[(p["name"], model)] = (time.time() + 60, "erreur réseau")
+            last = f"{model}: {e!r}"
+        print(f"[{p['name']}] fallback -> {last}")
+    raise ProviderUnavailable(p["name"], last)
 
 
 def build_system(p, others, allow_tools, servers="", extra="", actions=True):
@@ -954,7 +1188,7 @@ async def generate(p, channel, extra_system="", turn_prompt=None, after_id=None,
         transcript = "(...début de la conversation tronqué...)\n" + (cut[nl + 1:] if nl != -1 else cut)
 
     others = ", ".join(x["name"] for x in PERSONAS if x is not p)
-    fn = ask_gemini if p["provider"] == "gemini" else ask_openrouter
+    fn = ask_gemini if p["provider"] == "gemini" else ask_openai_compat
     tool_log = ""
     text = ""
     gl = resource_guilds(channel.guild)
@@ -1055,24 +1289,51 @@ async def get_webhook(channel):
 
 
 async def conversation(channel, last_speaker=None):
-    idx = 0
-    for _ in range(max_turns):
-        candidates = [p for p in PERSONAS if p["name"] != last_speaker]
+    active = pick_active(CHAT_PARTICIPANTS)
+    if not active:
+        await channel.send("⚠️ Aucune IA disponible pour le moment (quotas atteints ou clés manquantes). "
+                           "Réessaie plus tard (voir /ia_status).", allowed_mentions=NO_MENTIONS)
+        return
+    idx = turns_done = failovers = 0
+    while turns_done < max_turns and active:
+        candidates = [p for p in active if p["name"] != last_speaker] or active
         p = candidates[idx % len(candidates)]
         idx += 1
         try:
             async with channel.typing():
                 text = await generate(p, channel)
-        except Exception as e:
-            print(f"[{p['name']}] erreur: {e}")
-            return
-        try:
             await send_as(p, channel, text)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print(f"Erreur d'envoi dans #{channel.name} (permissions ?) : {e!r}")
-            return
+            failovers += 1
+            reason = (getattr(e, "reason", None) or str(e))[:80]
+            print(f"[{p['name']}] erreur: {e}")
+            mark_persona_down(p, 300, reason)
+            repl = pick_active(1, avoid={x["name"] for x in active})
+            pos = active.index(p)
+            if repl:
+                active[pos] = repl[0]
+                note = f"⚠️ {p['name']} indisponible ({reason}) : remplacée par {repl[0]['name']}."
+            else:
+                active.pop(pos)
+                note = f"⚠️ {p['name']} indisponible ({reason}) : aucune IA de remplacement."
+            try:
+                await channel.send(note, allowed_mentions=NO_MENTIONS)
+            except Exception:
+                pass
+            if failovers > MAX_FAILOVERS:
+                break
+            continue
+        turns_done += 1
         last_speaker = p["name"]
         await asyncio.sleep(DELAY)
+    if not active:
+        try:
+            await channel.send("⚠️ Plus aucune IA disponible (quotas atteints). Voir /ia_status.",
+                               allowed_mentions=NO_MENTIONS)
+        except Exception:
+            pass
 
 
 # ===================== MODE RÉFLEXION =====================
@@ -1184,15 +1445,24 @@ async def deliver_answer(message, text):
 
 async def deliberate(message, rch):
     main = message.channel
-    names = [p["name"] for p in PERSONAS]
-    extra = REFLEXION_SYSTEM.replace("{names}", ", ".join(names))
+    active = pick_active(REFLEXION_PARTICIPANTS)
+    if not active:
+        await deliver_answer(message, "⚠️ Aucune IA disponible pour le moment (quotas atteints ou "
+                                      "clés manquantes). Réessaie plus tard (voir /ia_status).")
+        return
     proposal, proposer = None, None
-    approvals, checks = set(), {n: 0 for n in names}
-    invalid, validated = 0, False
+    approvals, checks = set(), {p["name"]: 0 for p in active}
+    invalid = failovers = turn = idx = 0
+    validated, stop_reason = False, "turns"
     async with main.typing():
         post = await post_question(message, rch)
-        for turn in range(REFLEXION_MAX_TURNS):
-            p = PERSONAS[turn % len(PERSONAS)]
+        while turn < REFLEXION_MAX_TURNS:
+            if not active:
+                stop_reason = "unavailable"
+                break
+            p = active[idx % len(active)]
+            names = [x["name"] for x in active]
+            extra = REFLEXION_SYSTEM.replace("{names}", ", ".join(names))
             prompt = reflexion_turn_prompt(p, proposal, proposer, approvals, checks, names)
             try:
                 async with rch.typing():
@@ -1203,39 +1473,70 @@ async def deliberate(message, rch):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"[réflexion] [{p['name']}] erreur: {e!r}")
-                break
+                # Quota dépassé / panne : cette IA est mise en pause et une autre la remplace
+                failovers += 1
+                reason = (getattr(e, "reason", None) or str(e))[:80]
+                print(f"[réflexion] [{p['name']}] erreur: {e}")
+                mark_persona_down(p, 300, reason)
+                approvals.discard(p["name"])
+                checks.pop(p["name"], None)
+                repl = pick_active(1, avoid={x["name"] for x in active})
+                pos = active.index(p)
+                if repl:
+                    active[pos] = repl[0]
+                    checks[repl[0]["name"]] = 0
+                    note = f"⚠️ {p['name']} indisponible ({reason}) : remplacée par {repl[0]['name']}."
+                else:
+                    active.pop(pos)
+                    note = f"⚠️ {p['name']} indisponible ({reason}) : aucune IA de remplacement."
+                try:
+                    await rch.send(note, allowed_mentions=NO_MENTIONS)
+                except Exception:
+                    pass
+                if failovers > MAX_FAILOVERS:
+                    stop_reason = "unavailable"
+                    break
+                continue
             kind, prop = parse_reflexion(text)
             if kind == "invalid" or (kind == "accord" and proposal is None):
                 invalid += 1
-                if invalid >= 3:
+                idx += 1
+                turn += 1
+                if invalid >= 3 * max(len(active), 1):
+                    stop_reason = "invalid"
                     break
                 continue
             invalid = 0
-            checks[p["name"]] += 1
+            checks[p["name"]] = checks.get(p["name"], 0) + 1
             if kind == "proposal" and (proposal is None or not same_text(prop, proposal)):
                 proposal, proposer = prop, p["name"]
                 approvals = {p["name"]}          # le proposant approuve son propre texte
             else:                                # ACCORD, ou proposition identique
                 approvals.add(p["name"])
-            if (len(approvals) == len(names)
-                    and all(c >= REFLEXION_MIN_CHECKS for c in checks.values())):
+            names = [x["name"] for x in active]
+            if (names and set(names) <= approvals
+                    and all(checks.get(n, 0) >= REFLEXION_MIN_CHECKS for n in names)):
                 validated = True
                 break
+            turn += 1
+            idx += 1
             await asyncio.sleep(DELAY)
 
+    why = {"turns": f"limite de {REFLEXION_MAX_TURNS} tours atteinte sans consensus",
+           "unavailable": "les IA sont devenues indisponibles, quotas atteints",
+           "invalid": "les IA n'ont pas respecté le format demandé"}.get(stop_reason, stop_reason)
+    single = len(active) < 2 and REFLEXION_PARTICIPANTS >= 2
     if validated:
-        await deliver_answer(message, proposal)
-        await rch.send(f"✅ Consensus atteint : réponse envoyée dans {main.mention}.",
-                       allowed_mentions=NO_MENTIONS)
+        await deliver_answer(message, ("⚠️ Validé par une seule IA :\n" if single else "") + proposal)
+        await rch.send(f"✅ {'Validé par une seule IA' if single else 'Consensus atteint'} : réponse "
+                       f"envoyée dans {main.mention}.", allowed_mentions=NO_MENTIONS)
     elif proposal:
         await deliver_answer(message, "⚠️ Non validé par toutes les IA :\n" + proposal)
-        await rch.send(f"⚠️ Pas de consensus après {REFLEXION_MAX_TURNS} tours max : dernière "
-                       f"proposition envoyée dans {main.mention} avec un avertissement.",
-                       allowed_mentions=NO_MENTIONS)
+        await rch.send(f"⚠️ Pas de consensus ({why}) : dernière proposition envoyée dans "
+                       f"{main.mention} avec un avertissement.", allowed_mentions=NO_MENTIONS)
     else:
-        await deliver_answer(message, "⚠️ Les IA n'ont pas réussi à produire de réponse.")
-        await rch.send("⚠️ Aucune proposition exploitable.", allowed_mentions=NO_MENTIONS)
+        await deliver_answer(message, f"⚠️ Les IA n'ont pas réussi à produire de réponse ({why}).")
+        await rch.send(f"⚠️ Aucune proposition exploitable ({why}).", allowed_mentions=NO_MENTIONS)
 
 
 async def start_conversation(message):
@@ -1300,6 +1601,9 @@ async def on_ready():
     if session is None:
         session = aiohttp.ClientSession()
     print(f"Connecté : {bot.user} | salons IA : {sorted(ai_channels)}")
+    print("IA actives : " + (", ".join(p["name"] for p in PERSONAS) or "AUCUNE (aucune clé API définie)"))
+    for line in status_lines():
+        print("  " + line)
     # Diagnostic de la configuration d'écriture (visible dans les logs Railway)
     if not (WORKSPACE_GUILD_ID or WRITE_ONLY_GUILD_IDS):
         print("⚠️ Écriture dans d'autres salons DÉSACTIVÉE : définis WORKSPACE_GUILD_ID "
@@ -1499,6 +1803,26 @@ async def remove_ia_reflexion(interaction: discord.Interaction, salon: Optional[
     await interaction.response.send_message(
         f"🛑 Mode réflexion désactivé (le salon <#{rid}> n'est pas supprimé : tu peux le supprimer toi-même).",
         ephemeral=True)
+
+
+@bot.tree.command(name="ia_status", description="Montre quelles IA sont prêtes ou en pause (quota)")
+@app_commands.guild_only()
+async def ia_status(interaction: discord.Interaction):
+    text = "**État des IA**\n" + "\n".join(status_lines())
+    text += (f"\n\nChat : {CHAT_PARTICIPANTS} IA · Débat : {REFLEXION_PARTICIPANTS} IA "
+             "(les suivantes de la liste sont des remplaçantes automatiques).")
+    await interaction.response.send_message(text[:1900], ephemeral=True)
+
+
+@bot.tree.command(name="ia_reset", description="Réactive toutes les IA mises en pause")
+@app_commands.guild_only()
+async def ia_reset(interaction: discord.Interaction):
+    if not await is_admin(interaction.user):
+        await interaction.response.send_message("⛔ Réservé au propriétaire du bot.", ephemeral=True)
+        return
+    _cooldown.clear()
+    _persona_cooldown.clear()
+    await interaction.response.send_message("✅ Toutes les pauses ont été levées.", ephemeral=True)
 
 
 load_state()
