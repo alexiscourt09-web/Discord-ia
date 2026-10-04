@@ -155,7 +155,7 @@ MAX_TOOL_CHARS = 30000 # taille max du résultat d'un outil
 MAX_WORKSPACE_CHANNELS = 495 # on s'arrête avant la limite de 500 salons
 CLEAR_MAX_MESSAGES = 500   # nb max de messages lus après un /clear
 MAX_CONTEXT_CHARS = 200_000  # taille max du contexte envoyé aux IA
-REFLEXION_MIN_CHECKS = 2     # nb minimal de vérifications par IA avant d'accepter une réponse
+REFLEXION_MIN_CHECKS = 1     # nb de tours minimum par IA avant de répondre, si le message n'a pas de [x]
 REFLEXION_MAX_TURNS = 48     # nb max de tours de réflexion (sécurité anti-boucle)
 REFLEXION_PARTICIPANTS = 4   # nb d'IA qui débattent ensemble (les suivantes sont des remplaçantes)
 CHAT_PARTICIPANTS = 2        # nb d'IA qui discutent en mode normal
@@ -1253,6 +1253,8 @@ async def generate(p, channel, extra_system="", turn_prompt=None, after_id=None,
         if m.content.startswith("!"):
             continue
         body = m.content
+        if not getattr(m, "webhook_id", None) and not getattr(m.author, "bot", False):
+            body = strip_rounds(body)        # on retire le [x] des messages humains
         ex = extras.get(m.id)
         if ex:
             t = ex["text"] if i < 6 else ex["text"][:1000]   # allège les vieux messages
@@ -1372,14 +1374,14 @@ async def get_webhook(channel):
     return hook
 
 
-async def conversation(channel, last_speaker=None):
+async def conversation(channel, last_speaker=None, min_each=1):
     active = pick_active(CHAT_PARTICIPANTS)
     if not active:
         await channel.send("⚠️ Aucune IA disponible pour le moment (quotas atteints ou clés manquantes). "
                            "Réessaie plus tard (voir /ia_status).", allowed_mentions=NO_MENTIONS)
         return
     idx = turns_done = failovers = 0
-    while turns_done < max_turns and active:
+    while turns_done < max(max_turns, min_each * len(active)) and active:
         candidates = [p for p in active if p["name"] != last_speaker] or active
         p = candidates[idx % len(candidates)]
         idx += 1
@@ -1469,29 +1471,51 @@ def parse_reflexion(text):
     return "invalid", None
 
 
+ROUNDS_RE = re.compile(r"\s*\[\s*(\d+)\s*\]\s*$")
+
+
+def parse_rounds(content):
+    """'Ma question [50]' -> ('Ma question', 50, ''). Sans [x] : le défaut (REFLEXION_MIN_CHECKS). Pas de maximum."""
+    m = ROUNDS_RE.search(content or "")
+    if not m:
+        return content, REFLEXION_MIN_CHECKS, ""
+    return content[:m.start()].rstrip(), max(1, int(m.group(1))), ""
+
+
+def strip_rounds(content):
+    return ROUNDS_RE.sub("", content or "")
+
+
 def same_text(a, b):
     f = lambda t: re.sub(r"\s+", " ", t).strip().lower()
     return f(a) == f(b)
 
 
-def reflexion_turn_prompt(p, proposal, proposer, approvals, checks, names):
+def reflexion_turn_prompt(p, proposal, proposer, approvals, checks, names, min_checks=None):
     me = p["name"]
+    min_checks = REFLEXION_MIN_CHECKS if min_checks is None else min_checks
+    deep = ""
+    if min_checks > 1:
+        deep = (f"\nExigence de l'utilisateur : réponse VRAIMENT complète, avec au moins {min_checks} "
+                "tours par IA. À chaque tour, cherche ce qui manque (informations oubliées, cas "
+                "particuliers, précisions, exceptions), complète la proposition et revérifie tout "
+                "avec des sources différentes, même si tu étais déjà d'accord.")
     if proposal is None:
         return (f"Il n'y a pas encore de proposition. {me}, fais les recherches et vérifications "
-                "nécessaires, puis écris la première PROPOSITION (format strict).")
+                "nécessaires, puis écris la première PROPOSITION (format strict)." + deep)
     t = (f"Proposition actuelle (de {proposer}) :\n<<<\n{proposal}\n>>>\n"
          f"Approuvée mot pour mot par : {', '.join(sorted(approvals)) or 'personne'}. "
-         f"Tes vérifications jusqu'ici : {checks[me]} (minimum requis : {REFLEXION_MIN_CHECKS}).\n"
+         f"Tes tours jusqu'ici : {checks.get(me, 0)} (minimum requis : {min_checks}).\n"
          "Vérifie à nouveau CHAQUE élément avec les outils (sans te fier aux vérifications "
          "précédentes), cherche activement une erreur, un oubli ou une phrase superflue, puis "
-         "réponds au format strict (VÉRIFICATIONS puis PROPOSITION ou ACCORD).")
-    if len(approvals) == len(names) and any(c < REFLEXION_MIN_CHECKS for c in checks.values()):
-        t += ("\nToutes les IA approuvent ce texte, mais une vérification supplémentaire "
-              "indépendante est obligatoire avant de le soumettre.")
+         "réponds au format strict (VÉRIFICATIONS puis PROPOSITION ou ACCORD)." + deep)
+    if len(approvals) == len(names) and any(c < min_checks for c in checks.values()):
+        t += ("\nToutes les IA approuvent ce texte, mais chaque IA doit encore faire au moins "
+              f"{min_checks} tour(s) avant de le soumettre : continue de vérifier et de compléter.")
     return t
 
 
-async def post_question(message, rch):
+async def post_question(message, rch, content=None, min_checks=None, note=""):
     """Poste la question (+ un peu de contexte) dans le salon de réflexion."""
     main = message.channel
     ctx = []
@@ -1500,10 +1524,14 @@ async def post_question(message, rch):
         if m.id <= clear_id:
             break
         if m.content.strip() and not m.content.startswith("!"):
-            ctx.append(f"{m.author.display_name}: {m.content[:300]}")
+            ctx.append(f"{m.author.display_name}: {strip_rounds(m.content)[:300]}")
     ctx.reverse()
+    content = message.content if content is None else content
     text = (f"[QUESTION] posée par {message.author.display_name} dans #{main.name} :\n"
-            f"{message.content}")
+            f"{content}")
+    if min_checks and min_checks > 1:
+        text += (f"\n\n[EXIGENCE : au moins {min_checks} tours par IA avant de répondre{note}. "
+                 "Réponse la plus complète possible.]")
     if ctx:
         text += "\n\n[Contexte récent du salon]\n" + "\n".join(ctx)
     first = None
@@ -1527,9 +1555,12 @@ async def deliver_answer(message, text):
             await message.channel.send(chunk, allowed_mentions=NO_MENTIONS)
 
 
-async def deliberate(message, rch):
+async def deliberate(message, rch, min_checks=None, content=None, note=""):
     main = message.channel
+    min_checks = REFLEXION_MIN_CHECKS if min_checks is None else min_checks
     active = pick_active(REFLEXION_PARTICIPANTS)
+    # Plus on exige de tours par IA, plus le plafond de sécurité monte
+    turn_limit = max(REFLEXION_MAX_TURNS, min_checks * REFLEXION_PARTICIPANTS * 2 + 12)
     if not active:
         await deliver_answer(message, "⚠️ Aucune IA disponible pour le moment (quotas atteints ou "
                                       "clés manquantes). Réessaie plus tard (voir /ia_status).")
@@ -1539,15 +1570,15 @@ async def deliberate(message, rch):
     invalid = failovers = turn = idx = 0
     validated, stop_reason = False, "turns"
     async with main.typing():
-        post = await post_question(message, rch)
-        while turn < REFLEXION_MAX_TURNS:
+        post = await post_question(message, rch, content, min_checks, note)
+        while turn < turn_limit:
             if not active:
                 stop_reason = "unavailable"
                 break
             p = active[idx % len(active)]
             names = [x["name"] for x in active]
             extra = REFLEXION_SYSTEM.replace("{names}", ", ".join(names))
-            prompt = reflexion_turn_prompt(p, proposal, proposer, approvals, checks, names)
+            prompt = reflexion_turn_prompt(p, proposal, proposer, approvals, checks, names, min_checks)
             try:
                 async with rch.typing():
                     text = await generate(
@@ -1563,12 +1594,12 @@ async def deliberate(message, rch):
                 print(f"[réflexion] [{p['name']}] erreur: {e}")
                 mark_persona_down(p, 300, reason)
                 approvals.discard(p["name"])
-                checks.pop(p["name"], None)
+                done_turns = checks.pop(p["name"], 0)
                 repl = pick_active(1, avoid={x["name"] for x in active})
                 pos = active.index(p)
                 if repl:
                     active[pos] = repl[0]
-                    checks[repl[0]["name"]] = 0
+                    checks[repl[0]["name"]] = done_turns    # la remplaçante reprend là où l'autre s'est arrêtée
                     note = f"⚠️ {p['name']} indisponible ({reason}) : remplacée par {repl[0]['name']}."
                 else:
                     active.pop(pos)
@@ -1577,7 +1608,7 @@ async def deliberate(message, rch):
                     await rch.send(note, allowed_mentions=NO_MENTIONS)
                 except Exception:
                     pass
-                if failovers > MAX_FAILOVERS:
+                if failovers > MAX_FAILOVERS + min_checks * REFLEXION_PARTICIPANTS:
                     stop_reason = "unavailable"
                     break
                 continue
@@ -1599,14 +1630,14 @@ async def deliberate(message, rch):
                 approvals.add(p["name"])
             names = [x["name"] for x in active]
             if (names and set(names) <= approvals
-                    and all(checks.get(n, 0) >= REFLEXION_MIN_CHECKS for n in names)):
+                    and all(checks.get(n, 0) >= min_checks for n in names)):
                 validated = True
                 break
             turn += 1
             idx += 1
             await asyncio.sleep(DELAY)
 
-    why = {"turns": f"limite de {REFLEXION_MAX_TURNS} tours atteinte sans consensus",
+    why = {"turns": f"limite de {turn_limit} tours atteinte sans consensus",
            "unavailable": "les IA sont devenues indisponibles, quotas atteints",
            "invalid": "les IA n'ont pas respecté le format demandé"}.get(stop_reason, stop_reason)
     single = len(active) < 2 and REFLEXION_PARTICIPANTS >= 2
@@ -1637,10 +1668,11 @@ async def start_conversation(message):
     rch = bot.get_channel(reflexion[cid]) if cid in reflexion else None
     if cid in reflexion and rch is None:
         print(f"⚠️ Salon de réflexion {reflexion[cid]} introuvable : mode normal pour #{message.channel.name}")
+    clean, x, note = parse_rounds(message.content)     # [x] à la fin du message
     if rch is not None:
-        tasks[cid] = asyncio.create_task(deliberate(message, rch))
+        tasks[cid] = asyncio.create_task(deliberate(message, rch, x, clean, note))
     else:
-        tasks[cid] = asyncio.create_task(conversation(message.channel))
+        tasks[cid] = asyncio.create_task(conversation(message.channel, min_each=x))
 
 
 # ---------- sauvegarde de l'état (salons IA + /clear) ----------
@@ -1863,7 +1895,8 @@ async def add_ia_reflexion(interaction: discord.Interaction,
     await interaction.followup.send(
         f"✅ Mode réflexion activé : les IA débattront dans {rch.mention} et posteront seulement la "
         f"réponse validée dans {ch.mention}. Chaque message envoyé dans {ch.mention} lance une réflexion "
-        "(plus lente, mais vérifiée). /remove_ia_reflexion pour revenir au mode normal.",
+        "(plus lente, mais vérifiée). Astuce : écris [3] à la fin d'un message pour exiger au moins 3 tours "
+        "par IA. /remove_ia_reflexion pour revenir au mode normal.",
         ephemeral=True)
 
 
