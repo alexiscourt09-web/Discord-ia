@@ -1049,6 +1049,90 @@ def status_lines():
     return lines
 
 
+# ===================== FORMAT "HARMONY" (GPT-OSS) =====================
+# Certains hébergeurs (Cloudflare surtout) renvoient les jetons bruts de gpt-oss, par ex.
+#   <|start|>assistant<|channel|>commentary to=CHANNELS 1{"query":"fer seau"}<|call|>
+# On les convertit en lignes "CHANNELS: fer seau" que le bot sait exécuter, ou en texte propre.
+
+HARMONY_TOOLS = {
+    "search": "SEARCH", "browser.search": "SEARCH", "web.search": "SEARCH", "web_search": "SEARCH",
+    "fetch": "FETCH", "open": "FETCH", "browser.open": "FETCH", "open_url": "FETCH",
+    "channels": "CHANNELS", "read": "READ", "write": "WRITE", "create": "CREATE", "rename": "RENAME",
+}
+
+
+def _harmony_arg(kind, chunk):
+    j = chunk[chunk.find("{"): chunk.rfind("}") + 1] if "{" in chunk and "}" in chunk else ""
+    d = None
+    if j:
+        try:
+            d = json.loads(j)
+        except Exception:
+            d = None
+    if isinstance(d, dict):
+        def first(*keys):
+            for k in keys:
+                if isinstance(d.get(k), (str, int)) and str(d[k]).strip():
+                    return str(d[k]).strip()
+            return ""
+        if kind in ("SEARCH", "CHANNELS"):
+            arg = first("query", "q", "keywords", "text", "search")
+        elif kind == "FETCH":
+            arg = first("url", "link", "id", "query")
+        elif kind == "READ":
+            arg = first("name", "channel", "id", "query")
+            if arg and d.get("limit"):
+                arg += f" | {d['limit']}"
+        elif kind == "WRITE":
+            ch, msg = first("channel", "name", "id"), first("message", "text", "content")
+            arg = f"{ch} | {msg}" if ch and msg else ""
+        elif kind == "CREATE":
+            arg = first("name", "channel")
+            if arg:
+                arg += f" | {first('description', 'topic')}"
+        else:  # RENAME
+            a, b = first("old", "name", "channel"), first("new", "new_name", "to")
+            arg = f"{a} -> {b}" if a and b else ""
+        if arg:
+            return arg
+        for v in d.values():                      # dernier recours : première valeur texte
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    m = re.search(r'"(?:query|q|url|name|channel)"\s*:\s*"([^"]*)', j)
+    if m:
+        return m.group(1).strip()
+    if "<|message|>" in chunk:                    # appel sans JSON : le texte est l'argument
+        return chunk.split("<|message|>", 1)[1].strip()
+    return ""
+
+
+def clean_harmony(text):
+    """Convertit le format brut de gpt-oss en appels d'outils ou en texte propre."""
+    if "<|" not in text:
+        return text
+    calls = []
+    for chunk in text.split("<|call|>"):
+        m = re.search(r"to=(?:functions\.)?([\w.]+)", chunk)
+        kind = HARMONY_TOOLS.get(m.group(1).lower()) if m else None
+        if kind:
+            arg = _harmony_arg(kind, chunk)
+            if arg:
+                calls.append(f"{kind}: {arg}")
+    if calls:
+        return "\n".join(calls)
+    kept = []
+    for seg in re.split(r"<\|end\|>|<\|return\|>|<\|call\|>|<\|start\|>", text):
+        if "<|message|>" in seg:
+            header, body = seg.split("<|message|>", 1)
+            if "analysis" in header:              # le raisonnement interne n'est jamais posté
+                continue
+            kept.append(body)
+        elif "<|channel|>" not in seg:
+            kept.append(seg)
+    out = re.sub(r"<\|[^|>]*\|>", " ", "\n".join(kept))
+    return re.sub(r"[ \t]+", " ", out).strip()
+
+
 async def ask_gemini(p, system, prompt, images=None):
     last = "aucun modèle utilisable"
     parts = [{"inline_data": {"mime_type": mime, "data": base64.b64encode(d).decode()}}
@@ -1115,7 +1199,7 @@ async def ask_openai_compat(p, system, prompt, images=None):
             err = data.get("error") if isinstance(data, dict) else None
             if status == 200 and not err:
                 try:
-                    text = (data["choices"][0]["message"].get("content") or "").strip()
+                    text = clean_harmony((data["choices"][0]["message"].get("content") or "").strip())
                 except (KeyError, IndexError, TypeError, AttributeError):
                     text = ""
                 if text:
