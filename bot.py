@@ -66,7 +66,7 @@ def _env_models(var, default):
 def _generic_instructions(name):
     return (f"Tu es {name}, analytique et rigoureux. Tu vérifies toutes les infos que tu donnes, "
             "sauf si elles viennent d'un autre salon. Tu n'hésites pas à contredire les autres "
-            "IA si leur raisonnement est faux. Tu réponds en français.")
+            "IA si leur raisonnement est faux. Les sujets sont sur minecraft, vérifies toujours toutes les informations grace aux salons auxquels on te donne accès.Tu réponds en français.")
 
 
 ALL_PERSONAS = [
@@ -76,8 +76,8 @@ ALL_PERSONAS = [
         "key_env": "GEMINI_API_KEY",
         "models": _env_models("GEMINI_MODELS",
                               ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3-flash-preview"]),
-        "instructions": "Tu es Gemi, tu réponds de façon sérieuse en vérifiant toutes les infos que tu donnes. quand on te donne une info, tu dois la vérifier sauf si elle vient d’un autre salon. "
-        "Tu réponds en français.",
+        "instructions": "Tu es Gemi, tu réponds de façon sérieuse en vérifiant toutes les infos que tu donnes. quand on te donne une info, tu dois la vérifier sauf si elle vient d’un autre salon. Les sujets sont sur minecraft, vérifies toujours toutes les informations grace aux salons auxquels on te donne accès. "
+        "Les sujets sont sur minecraft, vérifies toujours toutes les informations grace aux salons auxquels on te donne accès. Tu réponds en français.",
     },
     {
         "name": "Nemo",
@@ -217,7 +217,7 @@ TOOLS_HELP = (
     "\n\nOUTILS (optionnels) : si tu as besoin d'infos récentes, de vérifier un fait "
     "ou de lire un lien, ta réponse peut être UNIQUEMENT une ou plusieurs lignes d'appel "
     "(une par ligne, 5 maximum, aucun autre texte) :\n"
-    "SEARCH: <requête>  -> recherche sur le web\n"
+    "SEARCH: <requête>  -> recherche sur le web. n’utilisez pas la recherche pour des infos trouvables sur le wiki de Minecraft.\n"
     "FETCH: <url>  -> lit une page web, un PDF, la transcription d'une vidéo YouTube, ou un lien "
     "discord.com/channels/... (le bot lit alors le salon/message si c'est autorisé)\n"
     "CHANNELS: <mots-clés>  -> cherche parmi des milliers de salons de ressources, d'après "
